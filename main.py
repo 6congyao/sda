@@ -7,7 +7,6 @@ import uuid
 from botocore.exceptions import NoCredentialsError
 from requests.adapters import HTTPAdapter, Retry
 
-
 def main():
     # initialization
     # 1. Prepare environments;
@@ -29,7 +28,7 @@ def main():
     s3Res = boto3.resource('s3')
 
     taskTransMap = {'text-to-image': 'txt2img', 'image-to-image': 'img2img',
-               'extras-single-image': 'extra-single-image', 'extras-batch-images': 'extra-batch-images', 'interrogate': 'interrogate'}
+                    'extras-single-image': 'extra-single-image', 'extras-batch-images': 'extra-batch-images', 'interrogate': 'interrogate'}
 
     apiBaseUrl = "http://localhost:8080/sdapi/v1/"
 
