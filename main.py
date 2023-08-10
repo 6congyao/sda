@@ -172,21 +172,21 @@ def notify(images, response, header):
 
 
 def post_invocations(bucket, b64images, quality):
-    save_dir = datetime.date.today().strftime("%Y-%m-%d")
+    saveDir = datetime.date.today().strftime("%Y-%m-%d")
     if True:
         images = []
         for b64image in b64images:
-            bytes_data = export_pil_to_bytes(
+            bytesData = export_pil_to_bytes(
                 decode_to_image(b64image), quality)
-            image_id = datetime.datetime.now().strftime(
+            imageId = datetime.datetime.now().strftime(
                 f"%Y%m%d%H%M%S-{uuid.uuid4()}")
             suffix = 'png'
             bucket.put_object(
-                Body=bytes_data,
-                Key=f'{save_dir}/{image_id}.{suffix}',
+                Body=bytesData,
+                Key=f'{saveDir}/{imageId}.{suffix}',
                 ContentType=f'image/{suffix}'
             )
-            images.append(f's3://{s3Bucket}/{save_dir}/{image_id}.{suffix}')
+            images.append(f's3://{s3Bucket}/{saveDir}/{imageId}.{suffix}')
         return images
     else:
         return b64images
