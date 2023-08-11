@@ -55,13 +55,12 @@ def main():
         for message in received_messages:
             payload = json.loads(message.body)
 
-            taskType = payload['task']
+            taskHeader = payload.pop('alwayson_scripts', None)
+            taskType = taskHeader['task']
             apiFullPath = apiBaseUrl + taskTransMap[taskType]
 
             if taskType == 'text-to-image':
-                taskPayload = payload['txt2img_payload']
-                taskHeader = taskPayload.pop('alwayson_scripts', None)
-                r = invoke_txt2img(apiFullPath, taskPayload)
+                r = invoke_txt2img(apiFullPath, payload)
                 imgOutputs = post_invocations(bucket, r['images'], 80)
                 print(json.dumps(notify(imgOutputs, r, taskHeader)))
                 delete_message(message)
