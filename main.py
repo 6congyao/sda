@@ -7,6 +7,7 @@ import datetime
 import requests
 import boto3
 import logging
+import traceback
 import uuid
 from botocore.exceptions import ClientError
 from PIL import PngImagePlugin, Image
@@ -52,35 +53,39 @@ def main():
     # 2. Translate parameteres;
     # 3. (opt)Download and encode;
     # 4. Call SD API;
-    # 5. Upload and notify;
+    # 5. Decode, upload and notify;
     # 6. Delete msg;
     while True:
         received_messages = receive_messages(queue, 1, SQS_WAIT_TIME_SECONDS)
         for message in received_messages:
-            payload = json.loads(message.body)
+            try:
+                payload = json.loads(message.body)
 
-            taskHeader = payload.pop('alwayson_scripts', None)
-            taskType = taskHeader['task']
-            apiFullPath = apiBaseUrl + taskTransMap[taskType]
+                taskHeader = payload.pop('alwayson_scripts', None)
+                taskType = taskHeader['task']
+                print(
+                    f"Start process {taskType} task with ID: {taskHeader['id_task']}")
+                apiFullPath = apiBaseUrl + taskTransMap[taskType]
 
-            print(
-                f"Start process {taskType} task with ID: {taskHeader['id_task']}")
-            if taskType == 'text-to-image':
-                r = invoke_txt2img(apiFullPath, payload)
-                imgOutputs = post_invocations(
-                    bucket, taskHeader['save_dir'], r['images'], 80)
+                if taskType == 'text-to-image':
+                    r = invoke_txt2img(apiFullPath, payload)
+                    imgOutputs = post_invocations(
+                        bucket, taskHeader['save_dir'], r['images'], 80)
+                elif taskType == 'image-to-image':
+                    r = invoke_img2img(apiFullPath, payload, taskHeader)
+                    imgOutputs = post_invocations(
+                        bucket, taskHeader['save_dir'], r['images'], 80)
+
+            except Exception as e:
+                publish_message(topic, json.dumps(failed(taskHeader, repr(e))))
+                traceback.print_exc()
+            else:
                 publish_message(topic, json.dumps(
-                    notify(imgOutputs, r, taskHeader)))
+                    succeed(imgOutputs, r, taskHeader)))
+            finally:
                 delete_message(message)
-            elif taskType == 'image-to-image':
-                r = invoke_img2img(apiFullPath, payload, taskHeader)
-                imgOutputs = post_invocations(
-                    bucket, taskHeader['save_dir'], r['images'], 80)
-                publish_message(topic, json.dumps(
-                    notify(imgOutputs, r, taskHeader)))
-                delete_message(message)
-            print(
-                f"End process {taskType} task with ID: {taskHeader['id_task']}")
+                print(
+                    f"End process {taskType} task with ID: {taskHeader['id_task']}")
 
 
 def get_time(f):
@@ -149,14 +154,18 @@ def encode_to_base64(imgUrl):
     b64 = None
     try:
         if imgUrl.startswith("http://") or imgUrl.startswith("https://"):
-            b64 = str(base64.b64encode(requests.get(imgUrl).content))[2:-1]
+            response = requests.get(imgUrl)
+            if response.status_code == 200:
+                b64 = str(base64.b64encode(response.content))[2:-1]
+            else:
+                response.raise_for_status()
         elif imgUrl.startswith("s3://"):
             bucket, key = get_bucket_and_key(imgUrl)
             response = s3Res.Object(bucket, key).get()
             b64 = str(base64.b64encode(response['Body'].read()))[2:-1]
         return b64
-    except Exception as err:
-        return None
+    except Exception as e:
+        raise e
 
 
 def decode_to_image(encoding):
@@ -167,6 +176,8 @@ def decode_to_image(encoding):
             if response.status_code == 200:
                 encoding = response.text
                 image = Image.open(io.BytesIO(response.content))
+            else:
+                response.raise_for_status()
         elif encoding.startswith("s3://"):
             bucket, key = get_bucket_and_key(encoding)
             response = s3Res.Object(bucket, key).get()
@@ -176,8 +187,8 @@ def decode_to_image(encoding):
                 encoding = encoding.split(";")[1].split(",")[1]
             image = Image.open(io.BytesIO(base64.b64decode(encoding)))
         return image
-    except Exception as err:
-        return None
+    except Exception as e:
+        raise e
 
 
 def export_pil_to_bytes(image, quality):
@@ -207,7 +218,7 @@ def invoke_img2img(url, body, header):
     return do_invocations(url, body)
 
 
-def notify(images, response, header):
+def succeed(images, response, header):
     n_iter = response['parameters']['n_iter']
     batch_size = response['parameters']['batch_size']
     parameters = {}
@@ -220,6 +231,21 @@ def notify(images, response, header):
     parameters['error_msg'] = ''
     parameters['image_mask_url'] = ','.join(
         images[n_iter * batch_size:])
+    return {
+        'images': [''],
+        'parameters': parameters,
+        'info': ''
+    }
+
+
+def failed(header, message):
+    parameters = {}
+    parameters['id_task'] = header['id_task']
+    parameters['status'] = 0
+    parameters['image_url'] = ''
+    parameters['seed'] = []
+    parameters['error_msg'] = message
+    parameters['image_mask_url'] = ''
     return {
         'images': [''],
         'parameters': parameters,
