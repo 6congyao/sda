@@ -2,6 +2,7 @@ import os
 import io
 import base64
 import json
+import time
 import datetime
 import requests
 import boto3
@@ -16,6 +17,10 @@ sqsQueueUrl = os.getenv("SQS_QUEUE_URL")
 snsTopicArn = os.getenv("SNS_TOPIC_ARN")
 s3Bucket = os.getenv("S3_BUCKET")
 
+sqsRes = boto3.resource('sqs')
+snsRes = boto3.resource('sns')
+s3Res = boto3.resource('s3')
+
 
 def main():
     # initialization
@@ -29,13 +34,11 @@ def main():
     print(snsTopicArn)
     print(s3Bucket)
 
-    sqsRes = boto3.resource('sqs')
     queue = sqsRes.Queue(sqsQueueUrl)
     SQS_WAIT_TIME_SECONDS = 20
 
-    snsRes = boto3.resource('sns')
     topic = snsRes.Topic(snsTopicArn)
-    s3Res = boto3.resource('s3')
+
     bucket = s3Res.Bucket(s3Bucket)
 
     taskTransMap = {'text-to-image': 'txt2img', 'image-to-image': 'img2img',
@@ -60,14 +63,35 @@ def main():
             taskType = taskHeader['task']
             apiFullPath = apiBaseUrl + taskTransMap[taskType]
 
+            print(
+                f"Start process {taskType} task with ID: {taskHeader['id_task']}")
             if taskType == 'text-to-image':
                 r = invoke_txt2img(apiFullPath, payload)
-                imgOutputs = post_invocations(bucket, r['images'], 80)
+                imgOutputs = post_invocations(
+                    bucket, taskHeader['save_dir'], r['images'], 80)
                 publish_message(topic, json.dumps(
                     notify(imgOutputs, r, taskHeader)))
                 delete_message(message)
             elif taskType == 'image-to-image':
-                r = invoke_txt2img(apiFullPath, payload)
+                r = invoke_img2img(apiFullPath, payload, taskHeader)
+                imgOutputs = post_invocations(
+                    bucket, taskHeader['save_dir'], r['images'], 80)
+                publish_message(topic, json.dumps(
+                    notify(imgOutputs, r, taskHeader)))
+                delete_message(message)
+            print(
+                f"End process {taskType} task with ID: {taskHeader['id_task']}")
+
+
+def get_time(f):
+
+    def inner(*arg, **kwarg):
+        s_time = time.time()
+        res = f(*arg, **kwarg)
+        e_time = time.time()
+        print('Used: {} seconds.'.format(e_time - s_time))
+        return res
+    return inner
 
 
 def receive_messages(queue, max_number, wait_time):
@@ -97,6 +121,13 @@ def receive_messages(queue, max_number, wait_time):
         return messages
 
 
+def get_bucket_and_key(s3uri):
+    pos = s3uri.find('/', 5)
+    bucket = s3uri[5: pos]
+    key = s3uri[pos + 1:]
+    return bucket, key
+
+
 def delete_message(message):
     """
     Delete a message from a queue. Clients must delete messages after they
@@ -114,6 +145,20 @@ def delete_message(message):
         raise error
 
 
+def encode_to_base64(imgUrl):
+    b64 = None
+    try:
+        if imgUrl.startswith("http://") or imgUrl.startswith("https://"):
+            b64 = str(base64.b64encode(requests.get(imgUrl).content))[2:-1]
+        elif imgUrl.startswith("s3://"):
+            bucket, key = get_bucket_and_key(imgUrl)
+            response = s3Res.Object(bucket, key).get()
+            b64 = str(base64.b64encode(response['Body'].read()))[2:-1]
+        return b64
+    except Exception as err:
+        return None
+
+
 def decode_to_image(encoding):
     image = None
     try:
@@ -122,7 +167,10 @@ def decode_to_image(encoding):
             if response.status_code == 200:
                 encoding = response.text
                 image = Image.open(io.BytesIO(response.content))
-        # elif encoding.startswith("s3://"):
+        elif encoding.startswith("s3://"):
+            bucket, key = get_bucket_and_key(encoding)
+            response = s3Res.Object(bucket, key).get()
+            image = Image.open(response['Body'])
         else:
             if encoding.startswith("data:image/"):
                 encoding = encoding.split(";")[1].split(",")[1]
@@ -149,9 +197,14 @@ def export_pil_to_bytes(image, quality):
     return bytes_data
 
 
-def invoke_txt2img(url, json):
-    response = requests.post(url=url, json=json)
-    return response.json()
+def invoke_txt2img(url, body):
+    return do_invocations(url, body)
+
+
+def invoke_img2img(url, body, header):
+    imgUrls = header['image_link'].split(',')
+    body['init_images'] = [encode_to_base64(x) for x in imgUrls]
+    return do_invocations(url, body)
 
 
 def notify(images, response, header):
@@ -174,8 +227,16 @@ def notify(images, response, header):
     }
 
 
-def post_invocations(bucket, b64images, quality):
-    saveDir = datetime.date.today().strftime("%Y-%m-%d")
+@get_time
+def do_invocations(url, body):
+    response = requests.post(url=url, json=body)
+    return response.json()
+
+
+def post_invocations(bucket, folder, b64images, quality):
+    defaultFolder = datetime.date.today().strftime("%Y-%m-%d")
+    if not folder:
+        folder = defaultFolder
     if True:
         images = []
         for b64image in b64images:
@@ -186,11 +247,12 @@ def post_invocations(bucket, b64images, quality):
             suffix = 'png'
             bucket.put_object(
                 Body=bytesData,
-                Key=f'{saveDir}/{imageId}.{suffix}',
+                Key=f'{folder}/{imageId}.{suffix}',
                 ContentType=f'image/{suffix}'
             )
-            images.append(f's3://{s3Bucket}/{saveDir}/{imageId}.{suffix}')
+            images.append(f's3://{s3Bucket}/{folder}/{imageId}.{suffix}')
         return images
+    # todo
     else:
         return b64images
 
