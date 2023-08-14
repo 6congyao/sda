@@ -34,6 +34,7 @@ def main():
     SQS_WAIT_TIME_SECONDS = 20
 
     snsRes = boto3.resource('sns')
+    topic = snsRes.Topic(snsTopicArn)
     s3Res = boto3.resource('s3')
     bucket = s3Res.Bucket(s3Bucket)
 
@@ -62,8 +63,11 @@ def main():
             if taskType == 'text-to-image':
                 r = invoke_txt2img(apiFullPath, payload)
                 imgOutputs = post_invocations(bucket, r['images'], 80)
-                print(json.dumps(notify(imgOutputs, r, taskHeader)))
+                publish_message(topic, json.dumps(
+                    notify(imgOutputs, r, taskHeader)))
                 delete_message(message)
+            elif taskType == 'image-to-image':
+                r = invoke_txt2img(apiFullPath, payload)
 
 
 def receive_messages(queue, max_number, wait_time):
@@ -189,6 +193,19 @@ def post_invocations(bucket, b64images, quality):
         return images
     else:
         return b64images
+
+
+def publish_message(topic, message):
+    try:
+        response = topic.publish(Message=message)
+        message_id = response['MessageId']
+        logger.info(
+            "Published message to topic %s.", topic.arn)
+    except ClientError:
+        logger.exception("Couldn't publish message to topic %s.", topic.arn)
+        raise
+    else:
+        return message_id
 
 
 if __name__ == '__main__':
