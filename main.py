@@ -70,11 +70,11 @@ def main():
                 if taskType == 'text-to-image':
                     r = invoke_txt2img(apiFullPath, payload)
                     imgOutputs = post_invocations(
-                        bucket, taskHeader['save_dir'], r['images'], 80)
+                        bucket, taskHeader['save_dir']+taskHeader['id_task'], r['images'], 80)
                 elif taskType == 'image-to-image':
                     r = invoke_img2img(apiFullPath, payload, taskHeader)
                     imgOutputs = post_invocations(
-                        bucket, taskHeader['save_dir'], r['images'], 80)
+                        bucket, taskHeader['save_dir']+taskHeader['id_task'], r['images'], 80)
 
             except Exception as e:
                 publish_message(topic, json.dumps(failed(taskHeader, repr(e))))
