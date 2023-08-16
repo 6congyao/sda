@@ -11,6 +11,7 @@ import traceback
 import uuid
 from botocore.exceptions import ClientError
 from PIL import PngImagePlugin, Image
+from requests.adapters import HTTPAdapter, Retry
 
 logger = logging.getLogger(__name__)
 awsRegion = os.getenv("AWS_DEFAULT_REGION")
@@ -22,18 +23,23 @@ sqsRes = boto3.resource('sqs')
 snsRes = boto3.resource('sns')
 s3Res = boto3.resource('s3')
 
+sdClient = requests.Session()
+retries = Retry(
+    total=3,
+    connect=100,
+    backoff_factor=0.1,
+    allowed_methods=["GET", "POST"])
+sdClient.mount('http://', HTTPAdapter(max_retries=retries))
+REQUESTS_TIMEOUT_SECONDS = 30
+
 
 def main():
-    # initialization
+    # initialization:
     # 1. Prepare environments;
     # 2. AWS services resources(sqs/sns/s3);
     # 3. Parameter map;
-    # 4. SD api base url;
-
-    print(awsRegion)
-    print(sqsQueueUrl)
-    print(snsTopicArn)
-    print(s3Bucket)
+    # 4. SD api base url and http session client;
+    print_env()
 
     queue = sqsRes.Queue(sqsQueueUrl)
     SQS_WAIT_TIME_SECONDS = 20
@@ -46,6 +52,8 @@ def main():
                     'extras-single-image': 'extra-single-image', 'extras-batch-images': 'extra-batch-images', 'interrogate': 'interrogate'}
 
     apiBaseUrl = "http://localhost:8080/sdapi/v1/"
+
+    check_sd_readiness(apiBaseUrl+"memory")
 
     # main loop
     # todo: Implement scaleDown hook signal
@@ -87,6 +95,24 @@ def main():
                 delete_message(message)
                 print(
                     f"End process {taskType} task with ID: {taskHeader['id_task']}")
+
+
+def print_env():
+    print(awsRegion)
+    print(sqsQueueUrl)
+    print(snsTopicArn)
+    print(s3Bucket)
+
+
+def check_sd_readiness(url):
+    while True:
+        print('Checking SD readiness...')
+        r = sdClient.get(url, timeout=(1.0, 1.0))
+        if r.status_code == 200:
+            print('SD ready.')
+            break
+        else:
+            time.sleep(5)
 
 
 def get_time(f):
@@ -256,7 +282,10 @@ def failed(header, message):
 
 @get_time
 def do_invocations(url, body):
-    response = requests.post(url=url, json=body)
+    response = sdClient.post(
+        url=url, json=body, timeout=(1, REQUESTS_TIMEOUT_SECONDS))
+    if response.status_code != 200:
+        response.raise_for_status()
     return response.json()
 
 
