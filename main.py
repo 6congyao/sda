@@ -1,5 +1,6 @@
 import os
 import io
+import asyncio
 import base64
 import json
 import time
@@ -9,110 +10,124 @@ import boto3
 import logging
 import traceback
 import uuid
+import aioboto3
+import difflib
+from aiohttp_client_cache import CachedSession, CacheBackend
 from botocore.exceptions import ClientError
 from PIL import PngImagePlugin, Image
 from requests.adapters import HTTPAdapter, Retry
 
-logger = logging.getLogger(__name__)
-awsRegion = os.getenv("AWS_DEFAULT_REGION")
-sqsQueueUrl = os.getenv("SQS_QUEUE_URL")
-snsTopicArn = os.getenv("SNS_TOPIC_ARN")
-s3Bucket = os.getenv("S3_BUCKET")
 
+aws_default_region = os.getenv("AWS_DEFAULT_REGION")
+sqs_queue_url = os.getenv("SQS_QUEUE_URL")
+sns_topic_arn = os.getenv("SNS_TOPIC_ARN")
+s3_bucket = os.getenv("S3_BUCKET")
+dynamic_sd_model = os.getenv("DYNAMIC_SD_MODEL")
+
+current_model_name = ''
 sqsRes = boto3.resource('sqs')
-snsRes = boto3.resource('sns')
-s3Res = boto3.resource('s3')
+ab3_session = aioboto3.Session()
 
-sdClient = requests.Session()
+apiBaseUrl = "http://localhost:8080/sdapi/v1/"
+apiClient = requests.Session()
 retries = Retry(
     total=3,
     connect=100,
     backoff_factor=0.1,
     allowed_methods=["GET", "POST"])
-sdClient.mount('http://', HTTPAdapter(max_retries=retries))
+apiClient.mount('http://', HTTPAdapter(max_retries=retries))
 REQUESTS_TIMEOUT_SECONDS = 30
+
+cache = CacheBackend(
+    cache_name='memory-cache',
+    expire_after=600
+)
 
 
 def main():
-    # initialization:
-    # 1. Prepare environments;
+    # Initialization:
+    # 1. Environment parameters;
     # 2. AWS services resources(sqs/sns/s3);
-    # 3. Parameter map;
-    # 4. SD api base url and http session client;
+    # 3. SD API readiness check, current checkpoint cached;
     print_env()
 
-    queue = sqsRes.Queue(sqsQueueUrl)
+    queue = sqsRes.Queue(sqs_queue_url)
     SQS_WAIT_TIME_SECONDS = 20
 
-    topic = snsRes.Topic(snsTopicArn)
-
-    bucket = s3Res.Bucket(s3Bucket)
-
-    taskTransMap = {'text-to-image': 'txt2img', 'image-to-image': 'img2img',
-                    'extras-single-image': 'extra-single-image', 'extras-batch-images': 'extra-batch-images', 'interrogate': 'interrogate'}
-
-    apiBaseUrl = "http://localhost:8080/sdapi/v1/"
-
-    check_sd_readiness(apiBaseUrl+"memory")
+    check_readiness()
 
     # main loop
-    # todo: Implement scaleDown hook signal
+    # todo: Implement scale-in hook signal
     # 1. Pull msg from sqs;
     # 2. Translate parameteres;
-    # 3. (opt)Download and encode;
-    # 4. Call SD API;
-    # 5. Decode, upload and notify;
-    # 6. Delete msg;
+    # 3. (opt)Switch model;
+    # 4. (opt)Prepare inputs for image downloading and encoding;
+    # 5. Call SD API;
+    # 6. Prepare outputs for decoding, uploading and notifying;
+    # 7. Delete msg;
     while True:
         received_messages = receive_messages(queue, 1, SQS_WAIT_TIME_SECONDS)
+
         for message in received_messages:
+
             try:
                 snsPayload = json.loads(message.body)
                 payload = json.loads(snsPayload['Message'])
-                print(snsPayload['Message'])
                 taskHeader = payload.pop('alwayson_scripts', None)
                 taskType = taskHeader['task']
+                folder = get_prefix(payload['s3_output_path'])
                 print(
                     f"Start process {taskType} task with ID: {taskHeader['id_task']}")
-                apiFullPath = apiBaseUrl + taskTransMap[taskType]
+
+                if dynamic_sd_model == 'true' and taskHeader['sd_model_checkpoint']:
+                    switch_model(taskHeader['sd_model_checkpoint'])
+                    print(f'Current model is: {current_model_name}.')
 
                 if taskType == 'text-to-image':
-                    r = invoke_txt2img(apiFullPath, payload)
-                    imgOutputs = post_invocations(
-                        bucket, taskHeader['save_dir']+taskHeader['id_task'], r['images'], 80)
+                    r = invoke_txt2img(payload, taskHeader)
                 elif taskType == 'image-to-image':
-                    r = invoke_img2img(apiFullPath, payload, taskHeader)
-                    imgOutputs = post_invocations(
-                        bucket, taskHeader['save_dir']+taskHeader['id_task'], r['images'], 80)
+                    r = invoke_img2img(payload, taskHeader)
+                else:
+                    raise RuntimeError(
+                        f'Unsupported task type: {taskType}')
+
+                imgOutputs = post_invocations(folder, r, 80)
 
             except Exception as e:
-                publish_message(topic, json.dumps(failed(taskHeader, repr(e))))
+                content = json.dumps(failed(taskHeader, repr(e)))
                 traceback.print_exc()
             else:
-                publish_message(topic, json.dumps(
-                    succeed(imgOutputs, r, taskHeader)))
+                content = json.dumps(succeed(imgOutputs, r, taskHeader))
             finally:
+                handle_outputs(content, folder)
                 delete_message(message)
                 print(
                     f"End process {taskType} task with ID: {taskHeader['id_task']}")
 
 
 def print_env():
-    print(awsRegion)
-    print(sqsQueueUrl)
-    print(snsTopicArn)
-    print(s3Bucket)
+    print(f'AWS_DEFAULT_REGION={aws_default_region}')
+    print(f'SQS_QUEUE_URL={sqs_queue_url}')
+    print(f'SNS_TOPIC_ARN={sns_topic_arn}')
+    print(f'S3_BUCKET={s3_bucket}')
+    print(f'DYNAMIC_SD_MODEL={dynamic_sd_model}')
 
 
-def check_sd_readiness(url):
+def check_readiness():
     while True:
-        print('Checking SD readiness...')
-        r = sdClient.get(url, timeout=(1.0, 1.0))
-        if r.status_code == 200:
-            print('SD ready.')
+        try:
+            print('Checking service readiness...')
+            # checking with options "sd_model_checkpoint" also for caching current model
+            opts = invoke_get_options()
+            print('Service is ready.')
+            if "sd_model_checkpoint" in opts:
+                global current_model_name
+                current_model_name = opts['sd_model_checkpoint']
+                print(f'Init model is: {current_model_name}.')
             break
-        else:
-            time.sleep(5)
+        except Exception as e:
+            print(repr(e))
+            time.sleep(1)
 
 
 def get_time(f):
@@ -121,7 +136,8 @@ def get_time(f):
         s_time = time.time()
         res = f(*arg, **kwarg)
         e_time = time.time()
-        print('Used: {} seconds.'.format(e_time - s_time))
+        print('Used: {:.4f} seconds on api: {}.'.format(
+            e_time - s_time, arg[0]))
         return res
     return inner
 
@@ -142,22 +158,26 @@ def receive_messages(queue, max_number, wait_time):
     try:
         messages = queue.receive_messages(
             MaxNumberOfMessages=max_number,
-            WaitTimeSeconds=wait_time
+            WaitTimeSeconds=wait_time,
+            AttributeNames=['All'],
+            MessageAttributeNames=['All']
         )
-        for msg in messages:
-            logger.info("Received message: %s: %s", msg.message_id, msg.body)
     except ClientError as error:
-        logger.exception("Couldn't receive messages from queue: %s", queue)
+        traceback.print_exc()
         raise error
     else:
         return messages
 
 
-def get_bucket_and_key(s3uri):
-    pos = s3uri.find('/', 5)
-    bucket = s3uri[5: pos]
-    key = s3uri[pos + 1:]
-    return bucket, key
+def publish_message(topic, message):
+    try:
+        response = topic.publish(Message=message)
+        message_id = response['MessageId']
+    except ClientError as error:
+        traceback.print_exc()
+        raise error
+    else:
+        return message_id
 
 
 def delete_message(message):
@@ -171,51 +191,38 @@ def delete_message(message):
     """
     try:
         message.delete()
-        logger.info("Deleted message: %s", message.message_id)
     except ClientError as error:
-        logger.exception("Couldn't delete message: %s", message.message_id)
+        traceback.print_exc()
         raise error
 
 
-def encode_to_base64(imgUrl):
-    b64 = None
-    try:
-        if imgUrl.startswith("http://") or imgUrl.startswith("https://"):
-            response = requests.get(imgUrl)
-            if response.status_code == 200:
-                b64 = str(base64.b64encode(response.content))[2:-1]
-            else:
-                response.raise_for_status()
-        elif imgUrl.startswith("s3://"):
-            bucket, key = get_bucket_and_key(imgUrl)
-            response = s3Res.Object(bucket, key).get()
-            b64 = str(base64.b64encode(response['Body'].read()))[2:-1]
-        return b64
-    except Exception as e:
-        raise e
+def get_bucket_and_key(s3uri):
+    pos = s3uri.find('/', 5)
+    bucket = s3uri[5: pos]
+    key = s3uri[pos + 1:]
+    return bucket, key
+
+
+def get_prefix(path):
+    pos = path.find('/')
+    return path[pos + 1:]
+
+
+def str_simularity(a, b):
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def encode_to_base64(buffer):
+    return str(base64.b64encode(buffer))[2:-1]
 
 
 def decode_to_image(encoding):
     image = None
     try:
-        if encoding.startswith("http://") or encoding.startswith("https://"):
-            response = requests.get(encoding)
-            if response.status_code == 200:
-                encoding = response.text
-                image = Image.open(io.BytesIO(response.content))
-            else:
-                response.raise_for_status()
-        elif encoding.startswith("s3://"):
-            bucket, key = get_bucket_and_key(encoding)
-            response = s3Res.Object(bucket, key).get()
-            image = Image.open(response['Body'])
-        else:
-            if encoding.startswith("data:image/"):
-                encoding = encoding.split(";")[1].split(",")[1]
-            image = Image.open(io.BytesIO(base64.b64decode(encoding)))
-        return image
+        image = Image.open(io.BytesIO(base64.b64decode(encoding)))
     except Exception as e:
         raise e
+    return image
 
 
 def export_pil_to_bytes(image, quality):
@@ -235,14 +242,68 @@ def export_pil_to_bytes(image, quality):
     return bytes_data
 
 
-def invoke_txt2img(url, body):
-    return do_invocations(url, body)
+def invoke_txt2img(body, header):
+    return do_invocations(apiBaseUrl+"txt2img", prepare_payload(body, header))
 
 
-def invoke_img2img(url, body, header):
-    imgUrls = header['image_link'].split(',')
-    body['init_images'] = [encode_to_base64(x) for x in imgUrls]
-    return do_invocations(url, body)
+def invoke_img2img(body, header):
+    return do_invocations(apiBaseUrl+"img2img", prepare_payload(body, header))
+
+
+def invoke_set_options(options):
+    return do_invocations(apiBaseUrl+"options", options)
+
+
+def invoke_get_options():
+    return do_invocations(apiBaseUrl+"options")
+
+
+def invoke_get_model_names():
+    return sorted([x["title"] for x in do_invocations(apiBaseUrl+"sd-models")])
+
+
+def invoke_refresh_checkpoints():
+    return do_invocations(apiBaseUrl+"refresh-checkpoints", {})
+
+
+def switch_model(name, find_closest=True):
+    global current_model_name
+    # check current model
+    if find_closest:
+        name = name.lower()
+        current = current_model_name.lower()
+
+    if name in current:
+        return current_model_name
+
+    # refresh then check from model list
+    invoke_refresh_checkpoints()
+    models = invoke_get_model_names()
+    found_model = None
+
+    # exact matching
+    if name in models:
+        found_model = name
+    # find closest
+    elif find_closest:
+        max_sim = 0.0
+        max_model = None
+        for model in models:
+            sim = str_simularity(name, model.lower())
+            if sim > max_sim:
+                max_sim = sim
+                max_model = model
+        found_model = max_model
+
+    if not found_model:
+        raise RuntimeError(f'Model not found: {name}')
+    elif found_model != current_model_name:
+        options = {}
+        options["sd_model_checkpoint"] = found_model
+        invoke_set_options(options)
+        current_model_name = found_model
+
+    return current_model_name
 
 
 def succeed(images, response, header):
@@ -281,49 +342,130 @@ def failed(header, message):
 
 
 @get_time
-def do_invocations(url, body):
-    response = sdClient.post(
-        url=url, json=body, timeout=(1, REQUESTS_TIMEOUT_SECONDS))
-    if response.status_code != 200:
-        response.raise_for_status()
+def do_invocations(url, body=None):
+    if body is None:
+        response = apiClient.get(url=url, timeout=(1.0, 3.0))
+    else:
+        response = apiClient.post(
+            url=url, json=body, timeout=(1, REQUESTS_TIMEOUT_SECONDS))
+    response.raise_for_status()
     return response.json()
 
 
-def post_invocations(bucket, folder, b64images, quality):
+def post_invocations(folder, response, quality):
     defaultFolder = datetime.date.today().strftime("%Y-%m-%d")
     if not folder:
         folder = defaultFolder
-    if True:
-        images = []
-        for b64image in b64images:
-            bytesData = export_pil_to_bytes(
-                decode_to_image(b64image), quality)
-            imageId = datetime.datetime.now().strftime(
-                f"%Y%m%d%H%M%S-{uuid.uuid4()}")
-            suffix = 'png'
-            bucket.put_object(
-                Body=bytesData,
-                Key=f'{folder}/{imageId}.{suffix}',
-                ContentType=f'image/{suffix}'
-            )
-            images.append(f's3://{s3Bucket}/{folder}/{imageId}.{suffix}')
-        return images
-    # todo
-    else:
-        return b64images
+    images = []
+    results = []
+    if "images" in response.keys():
+        images = [export_pil_to_bytes(decode_to_image(i), quality)
+                  for i in response["images"]]
+    elif "image" in response.keys():
+        images = [export_pil_to_bytes(
+            decode_to_image(response["image"]), quality)]
+
+    if len(images) > 0:
+        loop = asyncio.get_event_loop()
+        tasks = [async_upload(i, folder) for i in images]
+        results = loop.run_until_complete(asyncio.gather(*tasks))
+
+    return results
 
 
-def publish_message(topic, message):
+def handle_outputs(content, folder):
+    loop = asyncio.get_event_loop()
+    tasks = [async_upload(content, folder, None, suffix='out'),
+             async_publish_message(content)]
+    loop.run_until_complete(asyncio.wait(tasks))
+
+
+async def async_get(url):
     try:
-        response = topic.publish(Message=message)
-        message_id = response['MessageId']
-        logger.info(
-            "Published message to topic %s.", topic.arn)
-    except ClientError:
-        logger.exception("Couldn't publish message to topic %s.", topic.arn)
-        raise
-    else:
-        return message_id
+        if url.startswith("http://") or url.startswith("https://"):
+            async with CachedSession(cache=cache) as session:
+                async with session.get(url) as res:
+                    res.raise_for_status()
+                    # todo: need a counter to delete expired responses
+                    # await session.delete_expired_responses()
+                    # print(res.from_cache, res.created_at, res.expires, res.is_expired)
+                    return await res.read()
+        elif url.startswith("s3://"):
+            bucket, key = get_bucket_and_key(url)
+            async with ab3_session.resource("s3") as s3:
+                obj = await s3.Object(bucket, key)
+                res = await obj.get()
+                return await res['Body'].read()
+    except Exception as e:
+        raise e
+
+
+async def async_upload(object_bytes, folder, file_name=None, suffix=None):
+    try:
+        async with ab3_session.resource("s3") as s3:
+            if suffix == 'out':
+                content_type = f'application/json'
+                if file_name is None:
+                    file_name = f"response-{uuid.uuid4()}"
+            else:
+                suffix = 'png'
+                content_type = f'image/{suffix}'
+                if file_name is None:
+                    file_name = datetime.datetime.now().strftime(
+                        f"%Y%m%d%H%M%S-{uuid.uuid4()}")
+
+            bucket = await s3.Bucket(s3_bucket)
+            await bucket.put_object(
+                Body=object_bytes, Key=f'{folder}/{file_name}.{suffix}', ContentType=content_type)
+
+            return f's3://{s3_bucket}/{folder}/{file_name}.{suffix}'
+    except Exception as e:
+        raise e
+
+
+async def async_publish_message(content):
+    try:
+        async with ab3_session.resource("sns") as sns:
+            topic = await sns.Topic(sns_topic_arn)
+            response = await topic.publish(Message=content)
+            return response['MessageId']
+    except Exception as e:
+        raise e
+
+
+def prepare_payload(body, header):
+    try:
+        urls = []
+        offset = 0
+        # img2img image link
+        if 'image_link' in header:
+            urls.extend(header['image_link'].split(','))
+            offset = len(urls)
+        # ControlNet image link
+        if 'controlnet' in header:
+            for x in header['controlnet']['args']:
+                if 'image_link' in x:
+                    urls.append(x['image_link'])
+        # Generate payload including ControlNet units
+        if len(urls) > 0:
+            loop = asyncio.get_event_loop()
+            tasks = [async_get(u) for u in urls]
+            results = loop.run_until_complete(asyncio.gather(*tasks))
+            if offset > 0:
+                init_images = [encode_to_base64(x) for x in results[:offset]]
+                body.update({"init_images": init_images})
+
+            if 'controlnet' in header:
+                for x in header['controlnet']['args']:
+                    if 'image_link' in x:
+                        x['input_image'] = encode_to_base64(results[offset])
+                        offset += 1
+                body.update(
+                    {'alwayson_scripts': {'controlnet': header['controlnet']}})
+    except Exception as e:
+        raise e
+
+    return body
 
 
 if __name__ == '__main__':
