@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
 import os
 import io
 import asyncio
@@ -12,11 +15,17 @@ import traceback
 import uuid
 import aioboto3
 import difflib
+import signal
 from aiohttp_client_cache import CachedSession, CacheBackend
 from botocore.exceptions import ClientError
 from PIL import PngImagePlugin, Image
 from requests.adapters import HTTPAdapter, Retry
+from aws_xray_sdk.core import xray_recorder, patch_all
+from aws_xray_sdk.core.models.trace_header import TraceHeader
 
+patch_all()
+
+logging.getLogger("aws_xray_sdk").setLevel(logging.ERROR)
 
 aws_default_region = os.getenv("AWS_DEFAULT_REGION")
 sqs_queue_url = os.getenv("SQS_QUEUE_URL")
@@ -43,6 +52,8 @@ cache = CacheBackend(
     expire_after=600
 )
 
+shutdown = False
+
 
 def main():
     # Initialization:
@@ -66,43 +77,56 @@ def main():
     # 6. Prepare outputs for decoding, uploading and notifying;
     # 7. Delete msg;
     while True:
+        if shutdown:
+            print('Received SIGTERM, shutting down...')
+            break
+
         received_messages = receive_messages(queue, 1, SQS_WAIT_TIME_SECONDS)
 
         for message in received_messages:
+            with xray_recorder.in_segment('Queue-Agent') as segment:
+                # Retrieve x-ray trace header from SQS message
+                traceHeaderStr = message.attributes['AWSTraceHeader']
+                sqsTraceHeader = TraceHeader.from_header_str(traceHeaderStr)
+                # Update current segment to link with SQS
+                segment.trace_id = sqsTraceHeader.root
+                segment.parent_id = sqsTraceHeader.parent
+                segment.sampled = sqsTraceHeader.sampled
 
-            try:
-                snsPayload = json.loads(message.body)
-                payload = json.loads(snsPayload['Message'])
-                taskHeader = payload.pop('alwayson_scripts', None)
-                taskType = taskHeader['task']
-                folder = get_prefix(payload['s3_output_path'])
-                print(
-                    f"Start process {taskType} task with ID: {taskHeader['id_task']}")
+                try:
+                    snsPayload = json.loads(message.body)
+                    payload = json.loads(snsPayload['Message'])
+                    taskHeader = payload.pop('alwayson_scripts', None)
+                    taskType = taskHeader['task'] if 'task' in taskHeader else None
+                    folder = get_prefix(
+                        payload['s3_output_path']) if 's3_output_path' in payload else None
+                    print(
+                        f"Start process {taskType} task with ID: {taskHeader['id_task']}")
 
-                if dynamic_sd_model == 'true' and taskHeader['sd_model_checkpoint']:
-                    switch_model(taskHeader['sd_model_checkpoint'])
-                    print(f'Current model is: {current_model_name}.')
+                    if dynamic_sd_model == 'true' and taskHeader['sd_model_checkpoint']:
+                        switch_model(taskHeader['sd_model_checkpoint'])
+                        print(f'Current model is: {current_model_name}.')
 
-                if taskType == 'text-to-image':
-                    r = invoke_txt2img(payload, taskHeader)
-                elif taskType == 'image-to-image':
-                    r = invoke_img2img(payload, taskHeader)
+                    if taskType == 'text-to-image':
+                        r = invoke_txt2img(payload, taskHeader)
+                    elif taskType == 'image-to-image':
+                        r = invoke_img2img(payload, taskHeader)
+                    else:
+                        raise RuntimeError(
+                            f'Unsupported task type: {taskType}')
+
+                    imgOutputs = post_invocations(folder, r, 80)
+
+                except Exception as e:
+                    content = json.dumps(failed(taskHeader, repr(e)))
+                    traceback.print_exc()
                 else:
-                    raise RuntimeError(
-                        f'Unsupported task type: {taskType}')
-
-                imgOutputs = post_invocations(folder, r, 80)
-
-            except Exception as e:
-                content = json.dumps(failed(taskHeader, repr(e)))
-                traceback.print_exc()
-            else:
-                content = json.dumps(succeed(imgOutputs, r, taskHeader))
-            finally:
-                handle_outputs(content, folder)
-                delete_message(message)
-                print(
-                    f"End process {taskType} task with ID: {taskHeader['id_task']}")
+                    content = json.dumps(succeed(imgOutputs, r, taskHeader))
+                finally:
+                    handle_outputs(content, folder)
+                    delete_message(message)
+                    print(
+                        f"End process {taskType} task with ID: {taskHeader['id_task']}")
 
 
 def print_env():
@@ -128,6 +152,11 @@ def check_readiness():
         except Exception as e:
             print(repr(e))
             time.sleep(1)
+
+
+def signalHandler(signum, frame):
+    global shutdown
+    shutdown = True
 
 
 def get_time(f):
@@ -242,10 +271,12 @@ def export_pil_to_bytes(image, quality):
     return bytes_data
 
 
+@xray_recorder.capture('text-to-image')
 def invoke_txt2img(body, header):
     return do_invocations(apiBaseUrl+"txt2img", prepare_payload(body, header))
 
 
+@xray_recorder.capture('image-to-image')
 def invoke_img2img(body, header):
     return do_invocations(apiBaseUrl+"img2img", prepare_payload(body, header))
 
@@ -367,16 +398,19 @@ def post_invocations(folder, response, quality):
 
     if len(images) > 0:
         loop = asyncio.get_event_loop()
-        tasks = [async_upload(i, folder) for i in images]
+        tasks = [loop.create_task(async_upload(i, folder)) for i in images]
         results = loop.run_until_complete(asyncio.gather(*tasks))
 
     return results
 
 
 def handle_outputs(content, folder):
+    defaultFolder = datetime.date.today().strftime("%Y-%m-%d")
+    if not folder:
+        folder = defaultFolder
     loop = asyncio.get_event_loop()
-    tasks = [async_upload(content, folder, None, suffix='out'),
-             async_publish_message(content)]
+    tasks = [loop.create_task(async_upload(content, folder, None, suffix='out')),
+             loop.create_task(async_publish_message(content))]
     loop.run_until_complete(asyncio.wait(tasks))
 
 
@@ -449,7 +483,7 @@ def prepare_payload(body, header):
         # Generate payload including ControlNet units
         if len(urls) > 0:
             loop = asyncio.get_event_loop()
-            tasks = [async_get(u) for u in urls]
+            tasks = [loop.create_task(async_get(u)) for u in urls]
             results = loop.run_until_complete(asyncio.gather(*tasks))
             if offset > 0:
                 init_images = [encode_to_base64(x) for x in results[:offset]]
@@ -469,4 +503,6 @@ def prepare_payload(body, header):
 
 
 if __name__ == '__main__':
+    for sig in [signal.SIGINT, signal.SIGHUP, signal.SIGTERM]:
+        signal.signal(sig, signalHandler)
     main()
